@@ -1,13 +1,18 @@
 package com.playeverywhere.randomimageflash
 
-import android.content.Intent
+import android.Manifest
+import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -30,30 +35,85 @@ import kotlin.random.Random
 private enum class DisplayMode { GENERATED, PHOTOS }
 
 class MainActivity : ComponentActivity() {
-    private var pickedUris by mutableStateOf<List<Uri>>(emptyList())
-    private val photoPicker = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        pickedUris = uris
-        uris.forEach { uri ->
-            try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            catch (_: Exception) { }
-        }
+    private var galleryUris by mutableStateOf<List<Uri>>(emptyList())
+    private var galleryPermissionGranted by mutableStateOf(false)
+
+    private val galleryPermission: String
+        get() = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
+                else Manifest.permission.READ_EXTERNAL_STORAGE
+
+    private val permissionRequest = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        galleryPermissionGranted = granted
+        if (granted) refreshGallery()
     }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        galleryPermissionGranted = hasGalleryPermission()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                FlashScreen(photos = pickedUris, onChoosePhotos = { photoPicker.launch(arrayOf("image/*")) },
+                FlashScreen(
+                    photos = galleryUris,
+                    hasPermission = galleryPermissionGranted,
+                    onRequestPermission = { permissionRequest.launch(galleryPermission) },
+                    onRefreshGallery = { refreshGallery() },
                     loadBitmap = { uri ->
                         try { contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } }
                         catch (_: Exception) { null }
-                    })
+                    }
+                )
             }
+        }
+        if (galleryPermissionGranted) refreshGallery()
+        else permissionRequest.launch(galleryPermission)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (hasGalleryPermission()) {
+            galleryPermissionGranted = true
+            refreshGallery()
+        }
+    }
+
+    private fun hasGalleryPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, galleryPermission) == PackageManager.PERMISSION_GRANTED
+
+    private fun refreshGallery() {
+        if (!hasGalleryPermission()) {
+            galleryPermissionGranted = false
+            return
+        }
+        val found = mutableListOf<Uri>()
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        try {
+            contentResolver.query(collection, projection, null, null, sortOrder)?.use { cursor: Cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    found += Uri.withAppendedPath(collection, id.toString())
+                }
+            }
+            galleryUris = found
+            galleryPermissionGranted = true
+        } catch (_: SecurityException) {
+            galleryPermissionGranted = false
+        } catch (_: Exception) {
+            galleryUris = emptyList()
         }
     }
 }
 
 @Composable
-private fun FlashScreen(photos: List<Uri>, onChoosePhotos: () -> Unit, loadBitmap: (Uri) -> Bitmap?) {
+private fun FlashScreen(
+    photos: List<Uri>,
+    hasPermission: Boolean,
+    onRequestPermission: () -> Unit,
+    onRefreshGallery: () -> Unit,
+    loadBitmap: (Uri) -> Bitmap?
+) {
     var mode by remember { mutableStateOf(DisplayMode.GENERATED) }
     var rate by remember { mutableFloatStateOf(5f) }
     var running by remember { mutableStateOf(true) }
@@ -92,9 +152,18 @@ private fun FlashScreen(photos: List<Uri>, onChoosePhotos: () -> Unit, loadBitma
                         contentScale = if (fit) ContentScale.Fit else ContentScale.Crop)
                 } else {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(if (photos.isEmpty()) "Выбери фотографии" else "Не удалось открыть фото", color = Color.White)
+                        Text(
+                            when {
+                                !hasPermission -> "Нужен доступ к фотографиям"
+                                photos.isEmpty() -> "В галерее пока нет фотографий"
+                                else -> "Не удалось открыть фото"
+                            },
+                            color = Color.White
+                        )
                         Spacer(Modifier.height(8.dp))
-                        Button(onClick = onChoosePhotos) { Text("Выбрать фото") }
+                        Button(onClick = if (hasPermission) onRefreshGallery else onRequestPermission) {
+                            Text(if (hasPermission) "Обновить галерею" else "Разрешить доступ")
+                        }
                     }
                 }
             }
@@ -113,9 +182,11 @@ private fun FlashScreen(photos: List<Uri>, onChoosePhotos: () -> Unit, loadBitma
         if (mode == DisplayMode.PHOTOS) {
             Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text("Фото: ${photos.size}", color = Color.White)
+                Text("Фото в галерее: ${photos.size}", color = Color.White)
                 Spacer(Modifier.weight(1f))
-                TextButton(onClick = onChoosePhotos) { Text("Выбрать") }
+                TextButton(onClick = if (hasPermission) onRefreshGallery else onRequestPermission) {
+                    Text(if (hasPermission) "Обновить" else "Разрешить")
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Checkbox(checked = shuffle, onCheckedChange = { shuffle = it })
@@ -125,7 +196,7 @@ private fun FlashScreen(photos: List<Uri>, onChoosePhotos: () -> Unit, loadBitma
                 Text("Вписать", color = Color.White)
             }
         }
-        Text("Размер области изображения остаётся постоянным", color = Color.LightGray, fontSize = 12.sp)
+        Text("Новые фото добавляются автоматически при возвращении в приложение", color = Color.LightGray, fontSize = 12.sp)
     }
 }
 
